@@ -33,7 +33,10 @@ use crate::{
     server::{io_other, Server},
 };
 use arc_swap::ArcSwap;
-use rustls::{Certificate, PrivateKey, ServerConfig};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    ServerConfig,
+};
 use rustls_pemfile::Item;
 use std::time::Duration;
 use std::{fmt, io, net::SocketAddr, path::Path, sync::Arc};
@@ -279,13 +282,12 @@ impl fmt::Debug for RustlsConfig {
 }
 
 fn config_from_der(cert: Vec<Vec<u8>>, key: Vec<u8>) -> io::Result<ServerConfig> {
-    let cert = cert.into_iter().map(Certificate).collect();
-    let key = PrivateKey(key);
+    let cert = cert.into_iter().map(CertificateDer::from).collect();
+    let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
 
     let mut config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(cert, key)
+        .with_single_cert(cert, key_der)
         .map_err(io_other)?;
 
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
@@ -330,21 +332,20 @@ async fn config_from_pem_chain_file(
     chain: impl AsRef<Path>,
 ) -> io::Result<ServerConfig> {
     let cert = tokio::fs::read(cert.as_ref()).await?;
-    let cert = rustls_pemfile::certs(&mut cert.as_ref())
-        .map(|it| it.map(|it| rustls::Certificate(it.to_vec())))
-        .collect::<Result<Vec<_>, _>>()?;
+    let cert = rustls_pemfile::certs(&mut cert.as_ref()).collect::<Result<Vec<_>, _>>()?;
     let key = tokio::fs::read(chain.as_ref()).await?;
-    let key_cert: rustls::PrivateKey = match rustls_pemfile::read_one(&mut key.as_ref())?
+    let key_cert: PrivateKeyDer = match rustls_pemfile::read_one(&mut key.as_ref())?
         .ok_or_else(|| io_other("could not parse pem file"))?
     {
-        Item::Pkcs8Key(key) => Ok(rustls::PrivateKey(key.secret_pkcs8_der().to_vec().into())),
+        Item::Pkcs8Key(key) => Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            key.secret_pkcs8_der().to_vec(),
+        ))),
         x => Err(io_other(format!(
             "invalid certificate format, received: {x:?}"
         ))),
     }?;
 
     ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert, key_cert)
         .map_err(|_| io_other("invalid certificate"))
@@ -362,17 +363,10 @@ mod tests {
     use http_body_util::BodyExt;
     use hyper::client::conn::http1::{handshake, SendRequest};
     use hyper_util::rt::TokioIo;
-    use rustls::{
-        client::{ServerCertVerified, ServerCertVerifier},
-        Certificate, ClientConfig, ServerName,
-    };
-    use std::{
-        convert::TryFrom,
-        io,
-        net::SocketAddr,
-        sync::Arc,
-        time::{Duration, SystemTime},
-    };
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+    use std::{convert::TryFrom, io, net::SocketAddr, sync::Arc, time::Duration};
     use tokio::time::sleep;
     use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
     use tokio_rustls::TlsConnector;
@@ -552,13 +546,17 @@ mod tests {
         (handle, server_task, addr)
     }
 
-    async fn get_first_cert(addr: SocketAddr) -> Certificate {
+    async fn get_first_cert(addr: SocketAddr) -> CertificateDer<'static> {
         let stream = TcpStream::connect(addr).await.unwrap();
         let tls_stream = tls_connector().connect(dns_name(), stream).await.unwrap();
 
         let (_io, client_connection) = tls_stream.into_inner();
 
-        client_connection.peer_certificates().unwrap()[0].clone()
+        let peer_certificates = client_connection.peer_certificates().unwrap();
+
+        let cert = peer_certificates.first().cloned().unwrap();
+
+        cert.into_owned()
     }
 
     async fn connect(addr: SocketAddr) -> (SendRequest<Body>, JoinHandle<()>) {
@@ -586,24 +584,58 @@ mod tests {
     }
 
     fn tls_connector() -> TlsConnector {
+        #[derive(Debug)]
         struct NoVerify;
 
         impl ServerCertVerifier for NoVerify {
             fn verify_server_cert(
                 &self,
-                _end_entity: &Certificate,
-                _intermediates: &[Certificate],
-                _server_name: &ServerName,
-                _scts: &mut dyn Iterator<Item = &[u8]>,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
                 _ocsp_response: &[u8],
-                _now: SystemTime,
-            ) -> Result<ServerCertVerified, rustls::Error> {
+                _now: UnixTime,
+            ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+            {
                 Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                vec![
+                    SignatureScheme::RSA_PSS_SHA256,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::ECDSA_NISTP521_SHA512,
+                    SignatureScheme::ED25519,
+                    SignatureScheme::ED448,
+                ]
             }
         }
 
         let mut client_config = ClientConfig::builder()
-            .with_safe_defaults()
+            .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();
 
@@ -612,7 +644,7 @@ mod tests {
         TlsConnector::from(Arc::new(client_config))
     }
 
-    fn dns_name() -> ServerName {
+    fn dns_name() -> ServerName<'static> {
         ServerName::try_from("localhost").unwrap()
     }
 }
